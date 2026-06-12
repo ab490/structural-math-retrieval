@@ -1,17 +1,15 @@
 """
-Fine-tuning script for RoBERTa dense retriever on math triplets.
+Fine-tuning script for transformer-based dense retrievers on math triplets.
 
+Works with any HuggingFace AutoModel (RoBERTa, DeBERTa, BERT, etc.).
 Uses InfoNCE contrastive loss with in-batch negatives + explicit hard negatives.
-Each pooling strategy (cls, mean, last_token) is a separate training run so that
-training and evaluation use the same pooling — enabling clean ablation reporting.
+Each pooling strategy is a separate training run so that training and evaluation
+use the same pooling — enabling clean ablation reporting.
 
 Usage:
-    python src/roberta_finetune.py \\
-        --model roberta-base \\
-        --pooling mean \\
-        --train-file data/processed/triplets_train.jsonl \\
-        --val-file   data/processed/triplets_val.jsonl \\
-        --output-dir results/roberta-base-cls
+    python src/transformer_finetune.py --model roberta-base --pooling mean
+    python src/transformer_finetune.py --model microsoft/deberta-v3-large --pooling cls --batch-size 8 --grad-accum 8
+    python src/transformer_finetune.py --model microsoft/deberta-v2-xxlarge --pooling cls --batch-size 8 --grad-accum 8 --gradient-checkpointing
 """
 
 import argparse
@@ -37,7 +35,7 @@ from triplet_dataset import TripletDataset, collate_fn
 
 
 # ---------------------------------------------------------------------------
-# Embedding extraction (single forward pass for one text batch)
+# Embedding extraction
 # ---------------------------------------------------------------------------
 
 def embed(
@@ -151,6 +149,10 @@ def train(args: argparse.Namespace) -> None:
         tokenizer = AutoTokenizer.from_pretrained(args.model)
 
     tokenizer.padding_side = "right"
+
+    if args.gradient_checkpointing:
+        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+
     model = model.to(device)
     model.train()
 
@@ -224,7 +226,7 @@ def train(args: argparse.Namespace) -> None:
     best_step = 0
     accum_loss = 0.0
     no_improve_epochs = 0
-    stopped_epoch = args.epochs  # updated if early stopping fires
+    stopped_epoch = args.epochs
 
     for epoch in range(start_epoch, args.epochs + 1):
         model.train()
@@ -236,7 +238,6 @@ def train(args: argparse.Namespace) -> None:
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch", dynamic_ncols=True)
         for step, batch in enumerate(pbar, start=1):
-            # Reset accumulation window timer at the start of each window
             if (step - 1) % args.grad_accum == 0:
                 accum_t0 = time.time()
 
@@ -252,7 +253,6 @@ def train(args: argparse.Namespace) -> None:
             n_emb = embed(model, n_ids, n_mask, args.pooling)
 
             loss = infonce_loss(a_emb, p_emb, n_emb, args.temperature)
-            # Scale by grad_accum so the effective loss magnitude is consistent
             (loss / args.grad_accum).backward()
             accum_loss += loss.item()
 
@@ -300,7 +300,6 @@ def train(args: argparse.Namespace) -> None:
 
         # Flush any remaining accumulated gradients at end of epoch
         if step % args.grad_accum != 0:
-            elapsed = time.time() - accum_t0
             optimizer_step(model, optimizer, scheduler)
             global_step += 1
 
@@ -350,7 +349,6 @@ def train(args: argparse.Namespace) -> None:
     tokenizer.save_pretrained(final_dir)
     print(f"Final model saved to {final_dir}")
 
-    # Save run config alongside checkpoints
     config = vars(args)
     config["best_val_loss"] = best_val_loss
     config["best_epoch"] = best_epoch
@@ -369,10 +367,12 @@ def train(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fine-tune RoBERTa with InfoNCE contrastive loss")
+    p = argparse.ArgumentParser(
+        description="Fine-tune any HuggingFace transformer with InfoNCE contrastive loss"
+    )
 
-    p.add_argument("--model",       default="roberta-base",
-                   help="HuggingFace model ID or local path")
+    p.add_argument("--model",       required=True,
+                   help="HuggingFace model ID or local path (e.g. roberta-base, microsoft/deberta-v3-large)")
     p.add_argument("--pooling",     choices=["cls", "mean", "last_token"], required=True,
                    help="Pooling strategy — determines the model variant being trained")
     p.add_argument("--train-file",  default="data/processed/triplets_train.jsonl")
@@ -385,13 +385,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr",          type=float, default=2e-5)
     p.add_argument("--epochs",      type=int, default=15)
     p.add_argument("--patience",    type=int, default=3,
-                   help="Early stopping patience in epochs. Training stops if val loss does not improve for this many consecutive epochs.")
+                   help="Early stopping patience in epochs")
     p.add_argument("--max-len",     type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.07)
     p.add_argument("--warmup-ratio",type=float, default=0.1,
                    help="Fraction of total steps used for linear warmup")
     p.add_argument("--val-every",   type=int, default=500,
                    help="Validate every N optimizer steps")
+    p.add_argument("--gradient-checkpointing", action="store_true", default=False,
+                   help="Enable gradient checkpointing to reduce GPU memory at the cost of speed")
     p.add_argument("--resume-from", default=None,
                    help="Checkpoint directory to resume from (e.g. results/roberta-base-mean/checkpoint_epoch_05). "
                         "start-epoch is inferred from the directory name unless --start-epoch is also passed.")
@@ -405,7 +407,6 @@ def parse_args() -> argparse.Namespace:
         model_slug = args.model.split("/")[-1]
         args.output_dir = str(PROJECT_ROOT / "results" / f"{model_slug}-{args.pooling}")
 
-    # Resolve data paths relative to project root if not absolute
     for attr in ("train_file", "val_file"):
         path = Path(getattr(args, attr))
         if not path.is_absolute():

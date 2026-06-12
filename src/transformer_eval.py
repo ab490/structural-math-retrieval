@@ -1,5 +1,7 @@
 """
-Evaluation script for fine-tuned RoBERTa dense retriever.
+Evaluation script for fine-tuned transformer dense retrievers.
+
+Works with any HuggingFace AutoModel (RoBERTa, DeBERTa, BERT, etc.).
 
 Retrieval metrics (Phase 1):
   - Pairwise accuracy: sim(anchor, positive) > sim(anchor, negative)
@@ -8,17 +10,14 @@ Retrieval metrics (Phase 1):
   - NDCG@10: normalized discounted cumulative gain at rank 10 over full candidate pool
   - MRR: mean reciprocal rank of the positive over full candidate pool
 
-Also tracks inference latency vs sequence length (per professor feedback).
+Also tracks inference latency vs sequence length.
 
 Saves:
   <output-dir>/eval_results.json   — all metrics + run metadata
 
 Usage:
-    python src/roberta_eval.py \\
-        --checkpoint results/roberta-base-cls/best_model \\
-        --pooling mean \\
-        --test-file data/processed/triplets_test.jsonl \\
-        --output-dir results/roberta-base-cls
+    python src/transformer_eval.py --checkpoint results/roberta-base-mean/best_model --pooling mean
+    python src/transformer_eval.py --checkpoint roberta-base --pooling mean --output-dir results/roberta-base-zeroshot-mean
 """
 
 import argparse
@@ -82,7 +81,6 @@ def compute_retrieval_metrics(
         n_ids  = batch["negative_input_ids"].to(device)
         n_mask = batch["negative_attention_mask"].to(device)
 
-        # Time the anchor embedding only for a clean latency signal
         t0 = time.time()
         a_emb = embed_batch(model, a_ids, a_mask, pooling)
         if device.type == "cuda":
@@ -100,8 +98,8 @@ def compute_retrieval_metrics(
         p_emb = embed_batch(model, p_ids, p_mask, pooling)
         n_emb = embed_batch(model, n_ids, n_mask, pooling)
 
-        sim_pos = (a_emb * p_emb).sum(dim=-1)   # [B] cosine sim (vectors are normalised)
-        sim_neg = (a_emb * n_emb).sum(dim=-1)   # [B]
+        sim_pos = (a_emb * p_emb).sum(dim=-1)
+        sim_neg = (a_emb * n_emb).sum(dim=-1)
 
         sim_pos_all.extend(sim_pos.cpu().tolist())
         sim_neg_all.extend(sim_neg.cpu().tolist())
@@ -136,7 +134,7 @@ def summarise_latency(latency_log: list[dict]) -> dict:
         "median_tokens_per_sec": round(float(np.median(tps)), 1),
         "seq_len_range": [round(min(seq_lens), 1), round(max(seq_lens), 1)],
         "n_batches": len(latency_log),
-        "per_batch": latency_log,   # kept for plotting latency vs seq_len
+        "per_batch": latency_log,
     }
 
 
@@ -170,7 +168,6 @@ def compute_ranking_metrics(
     max_len = dataset.max_len
     records = dataset.records
 
-    # --- Build corpus of unique positive texts ---
     corpus_texts: list[str] = []
     corpus_idx_map: dict[str, int] = {}
     anchor_to_pos_idx: list[int] = []
@@ -185,7 +182,6 @@ def compute_ranking_metrics(
     corpus_size = len(corpus_texts)
     print(f"  Ranking corpus size: {corpus_size} unique positives")
 
-    # --- Embed entire corpus ---
     corpus_embs_list: list[torch.Tensor] = []
     for i in range(0, corpus_size, batch_size):
         batch_texts = corpus_texts[i : i + batch_size]
@@ -196,20 +192,16 @@ def compute_ranking_metrics(
             padding=True,
             return_tensors="pt",
         )
-        input_ids = enc["input_ids"].to(device)
-        attention_mask = enc["attention_mask"].to(device)
-        emb = embed_batch(model, input_ids, attention_mask, pooling)
+        emb = embed_batch(model, enc["input_ids"].to(device), enc["attention_mask"].to(device), pooling)
         corpus_embs_list.append(emb.cpu())
 
     corpus_embs = torch.cat(corpus_embs_list, dim=0)  # [N, D] on CPU
 
-    # --- Embed anchors in batches, compute rank of positive ---
     ndcg_scores: list[float] = []
     rr_scores: list[float] = []
 
     for i in range(0, len(records), batch_size):
-        batch_recs = records[i : i + batch_size]
-        anchor_texts = [r["anchor"] for r in batch_recs]
+        anchor_texts = [r["anchor"] for r in records[i : i + batch_size]]
         enc = tokenizer(
             anchor_texts,
             max_length=max_len,
@@ -217,18 +209,14 @@ def compute_ranking_metrics(
             padding=True,
             return_tensors="pt",
         )
-        input_ids = enc["input_ids"].to(device)
-        attention_mask = enc["attention_mask"].to(device)
-        anchor_embs = embed_batch(model, input_ids, attention_mask, pooling)  # [B, D]
+        anchor_embs = embed_batch(model, enc["input_ids"].to(device), enc["attention_mask"].to(device), pooling)
 
-        # Cosine sim against full corpus: [B, N]
         sims = anchor_embs @ corpus_embs.to(device).T
 
         for j, rec_idx in enumerate(range(i, min(i + batch_size, len(records)))):
             pos_idx = anchor_to_pos_idx[rec_idx]
-            sim_row = sims[j]                           # [N]
+            sim_row = sims[j]
             pos_score = sim_row[pos_idx]
-            # Rank = number of candidates with strictly higher score + 1
             rank = int((sim_row > pos_score).sum().item()) + 1
 
             ndcg_scores.append(1.0 / math.log2(rank + 1) if rank <= 10 else 0.0)
@@ -254,7 +242,6 @@ def evaluate(args: argparse.Namespace) -> None:
     dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
     print(f"Device: {device} | pooling: {args.pooling}")
 
-    # --- Load tokenizer & model ---
     checkpoint = Path(args.checkpoint)
     tokenizer = AutoTokenizer.from_pretrained(checkpoint)
     tokenizer.padding_side = "right"
@@ -263,7 +250,6 @@ def evaluate(args: argparse.Namespace) -> None:
     model = AutoModel.from_pretrained(checkpoint, dtype=dtype).to(device)
     model.eval()
 
-    # --- Dataset & loader ---
     test_ds = TripletDataset(args.test_file, tokenizer, args.max_len)
     test_loader = DataLoader(
         test_ds,
@@ -275,7 +261,6 @@ def evaluate(args: argparse.Namespace) -> None:
     )
     print(f"Test set: {len(test_ds)} triplets")
 
-    # --- Pairwise retrieval metrics ---
     print("Computing pairwise retrieval metrics ...")
     latency_log: list[dict] = []
     metrics = compute_retrieval_metrics(model, test_loader, device, args.pooling, latency_log)
@@ -287,14 +272,12 @@ def evaluate(args: argparse.Namespace) -> None:
     latency = summarise_latency(latency_log)
     print(f"  Tokens/sec (median): {latency.get('median_tokens_per_sec', 'N/A')}")
 
-    # --- Ranking metrics (NDCG@10, MRR) ---
     print("Computing ranking metrics (NDCG@10, MRR) ...")
     ranking = compute_ranking_metrics(model, test_ds, device, args.pooling, args.batch_size)
     print(f"  NDCG@10           : {ranking['ndcg_at_10']:.4f}")
     print(f"  MRR               : {ranking['mrr']:.4f}")
     print(f"  Corpus size       : {ranking['corpus_size']}")
 
-    # --- Save ---
     results = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "checkpoint": str(args.checkpoint),
@@ -317,10 +300,10 @@ def evaluate(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate fine-tuned RoBERTa retriever")
+    p = argparse.ArgumentParser(description="Evaluate fine-tuned transformer retriever")
 
     p.add_argument("--checkpoint",  required=True,
-                   help="Path to saved model checkpoint (best_model/ or final_model/)")
+                   help="HuggingFace model ID or path to saved checkpoint (best_model/ or final_model/)")
     p.add_argument("--pooling",     choices=["cls", "mean", "last_token"], required=True,
                    help="Must match the pooling used during training")
     p.add_argument("--test-file",   default="data/processed/triplets_test.jsonl")

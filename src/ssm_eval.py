@@ -1,10 +1,12 @@
 """
-Evaluation script for fine-tuned DeBERTa dense retriever.
+Evaluation script for fine-tuned Mamba-2 dense retriever.
 
 Retrieval metrics (Phase 1):
   - Pairwise accuracy: sim(anchor, positive) > sim(anchor, negative)
   - Margin: mean and median of (sim_pos - sim_neg)
   - Mean positive cosine sim / mean negative cosine sim
+  - NDCG@10: normalized discounted cumulative gain at rank 10 over full candidate pool
+  - MRR: mean reciprocal rank of the positive over full candidate pool
 
 Also tracks inference latency vs sequence length (per professor feedback).
 
@@ -12,11 +14,11 @@ Saves:
   <output-dir>/eval_results.json   — all metrics + run metadata
 
 Usage:
-    python src/deberta_eval.py \\
-        --checkpoint results/deberta-v3-base-cls/best_model \\
+    python src/ssm_eval.py \\
+        --checkpoint results/mamba2-130m-mean/best_model \\
         --pooling mean \\
         --test-file data/processed/triplets_test.jsonl \\
-        --output-dir results/deberta-v3-base-cls
+        --output-dir results/mamba2-130m-mean
 """
 
 import argparse
@@ -30,25 +32,26 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
-from transformers import AutoModel, DebertaV2Tokenizer
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from transformers import AutoTokenizer
 
 from constants import PROJECT_ROOT
+from mamba_io import load_mamba
 from train_utils import pool
 from triplet_dataset import TripletDataset, collate_fn
 
 
 def embed_batch(
-    model: AutoModel,
+    model: MambaLMHeadModel,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     pooling: str,
 ) -> torch.Tensor:
     """Returns L2-normalised embeddings [B, D]."""
     with torch.no_grad():
-        out = model(input_ids=input_ids, attention_mask=attention_mask)
-        hidden = out.last_hidden_state
-        emb = pool(hidden, attention_mask, pooling)
-        return F.normalize(emb, p=2, dim=-1)
+        hidden = model.backbone(input_ids)
+    emb = pool(hidden, attention_mask, pooling)
+    return F.normalize(emb, p=2, dim=-1)
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +59,7 @@ def embed_batch(
 # ---------------------------------------------------------------------------
 
 def compute_retrieval_metrics(
-    model: AutoModel,
+    model: MambaLMHeadModel,
     loader: DataLoader,
     device: torch.device,
     pooling: str,
@@ -143,7 +146,7 @@ def summarise_latency(latency_log: list[dict]) -> dict:
 # ---------------------------------------------------------------------------
 
 def compute_ranking_metrics(
-    model: AutoModel,
+    model: MambaLMHeadModel,
     dataset: TripletDataset,
     device: torch.device,
     pooling: str,
@@ -253,12 +256,22 @@ def evaluate(args: argparse.Namespace) -> None:
     print(f"Device: {device} | pooling: {args.pooling}")
 
     # --- Load tokenizer & model ---
-    checkpoint = Path(args.checkpoint)
-    tokenizer = DebertaV2Tokenizer.from_pretrained(checkpoint)
+    # Tokenizer is the canonical Mamba-2 one (gpt-neox-20b); we don't save it
+    # alongside the checkpoint since it never changes during training.
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+    tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    print(f"Loading model from {checkpoint} ...")
-    model = AutoModel.from_pretrained(checkpoint, dtype=dtype).to(device)
+    # --checkpoint can be either:
+    #   (a) a local fine-tuned checkpoint dir (best_model/ or final_model/) — load via mamba_io
+    #   (b) an HF model id (e.g. state-spaces/mamba2-130m) for zero-shot baselines
+    checkpoint_path = Path(args.checkpoint)
+    if checkpoint_path.is_dir() and (checkpoint_path / "config.json").exists():
+        print(f"Loading fine-tuned checkpoint from {checkpoint_path} ...")
+        model = load_mamba(checkpoint_path, device=device, dtype=dtype)
+    else:
+        print(f"Loading pretrained checkpoint from HF: {args.checkpoint} ...")
+        model = MambaLMHeadModel.from_pretrained(args.checkpoint, device=device, dtype=dtype)
     model.eval()
 
     # --- Dataset & loader ---
@@ -315,11 +328,11 @@ def evaluate(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate fine-tuned DeBERTa retriever")
+    p = argparse.ArgumentParser(description="Evaluate fine-tuned Mamba-2 retriever")
 
     p.add_argument("--checkpoint",  required=True,
                    help="Path to saved model checkpoint (best_model/ or final_model/)")
-    p.add_argument("--pooling",     choices=["cls", "mean", "last_token"], required=True,
+    p.add_argument("--pooling",     choices=["mean", "last_token"], required=True,
                    help="Must match the pooling used during training")
     p.add_argument("--test-file",   default="data/processed/triplets_test.jsonl")
     p.add_argument("--output-dir",  default=None,

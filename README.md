@@ -20,12 +20,10 @@ src/
   triplet_dataset.py      # shared dataset class
   train_utils.py          # shared pool, infonce_loss, StepLogger, optimizer_step
   constants.py            # paths
-  roberta_finetune.py     # RoBERTa training (InfoNCE, all poolings)
-  roberta_eval.py         # Phase 1 eval for RoBERTa
-  deberta_finetune.py     # DeBERTa training
-  deberta_eval.py         # Phase 1 eval for DeBERTa
-  mamba_finetune.py       # Mamba-2 training
-  mamba_eval.py           # Phase 1 eval for Mamba-2
+  transformer_finetune.py  # transformer training — RoBERTa, DeBERTa, any AutoModel
+  transformer_eval.py      # Phase 1 eval for transformers
+  ssm_finetune.py          # Mamba-2 (SSM) training
+  ssm_eval.py              # Phase 1 eval for Mamba-2
   mamba_io.py             # Mamba checkpoint loading
   phase2_eval.py          # Phase 2 clustering (ARI, silhouette)
   compare_results.py      # cross-model comparison table
@@ -63,62 +61,62 @@ uv run python src/build_diagnostic_set.py
 
 # 2. Training — checkpoints saved to results/<model-slug>-<pooling>/
 # RoBERTa
-uv run python src/roberta_finetune.py --model roberta-base  --pooling cls
-uv run python src/roberta_finetune.py --model roberta-base  --pooling mean
-uv run python src/roberta_finetune.py --model roberta-base  --pooling last_token
-uv run python src/roberta_finetune.py --model roberta-large --pooling cls
-uv run python src/roberta_finetune.py --model roberta-large --pooling mean
-uv run python src/roberta_finetune.py --model roberta-large --pooling last_token
+uv run python src/transformer_finetune.py --model roberta-base  --pooling cls
+uv run python src/transformer_finetune.py --model roberta-base  --pooling mean
+uv run python src/transformer_finetune.py --model roberta-base  --pooling last_token
+uv run python src/transformer_finetune.py --model roberta-large --pooling cls
+uv run python src/transformer_finetune.py --model roberta-large --pooling mean
+uv run python src/transformer_finetune.py --model roberta-large --pooling last_token
 
 # DeBERTa (--gradient-checkpointing for xxlarge to fit in memory)
-uv run python src/deberta_finetune.py --model microsoft/deberta-v3-large   --pooling cls        --batch-size 8 --grad-accum 8
-uv run python src/deberta_finetune.py --model microsoft/deberta-v3-large   --pooling mean       --batch-size 8 --grad-accum 8
-uv run python src/deberta_finetune.py --model microsoft/deberta-v3-large   --pooling last_token --batch-size 8 --grad-accum 8
-uv run python src/deberta_finetune.py --model microsoft/deberta-v2-xxlarge --pooling cls        --batch-size 8 --grad-accum 8 --gradient-checkpointing
+uv run python src/transformer_finetune.py --model microsoft/deberta-v3-large   --pooling cls        --batch-size 8 --grad-accum 8
+uv run python src/transformer_finetune.py --model microsoft/deberta-v3-large   --pooling mean       --batch-size 8 --grad-accum 8
+uv run python src/transformer_finetune.py --model microsoft/deberta-v3-large   --pooling last_token --batch-size 8 --grad-accum 8
+uv run python src/transformer_finetune.py --model microsoft/deberta-v2-xxlarge --pooling cls        --batch-size 8 --grad-accum 8 --gradient-checkpointing
 
 # Mamba-2 (reduce --batch-size / increase --grad-accum for larger models)
-uv run python src/mamba_finetune.py --model state-spaces/mamba2-130m --pooling mean
-uv run python src/mamba_finetune.py --model state-spaces/mamba2-130m --pooling last_token
-uv run python src/mamba_finetune.py --model state-spaces/mamba2-370m --pooling mean
-uv run python src/mamba_finetune.py --model state-spaces/mamba2-370m --pooling last_token
-uv run python src/mamba_finetune.py --model state-spaces/mamba2-1.3b --pooling mean       --batch-size 8 --grad-accum 8
-uv run python src/mamba_finetune.py --model state-spaces/mamba2-1.3b --pooling last_token --batch-size 8 --grad-accum 8
+uv run python src/ssm_finetune.py --model state-spaces/mamba2-130m --pooling mean
+uv run python src/ssm_finetune.py --model state-spaces/mamba2-130m --pooling last_token
+uv run python src/ssm_finetune.py --model state-spaces/mamba2-370m --pooling mean
+uv run python src/ssm_finetune.py --model state-spaces/mamba2-370m --pooling last_token
+uv run python src/ssm_finetune.py --model state-spaces/mamba2-1.3b --pooling mean       --batch-size 8 --grad-accum 8
+uv run python src/ssm_finetune.py --model state-spaces/mamba2-1.3b --pooling last_token --batch-size 8 --grad-accum 8
 
 # 3. Phase 1 eval — retrieval metrics on the 31k-triplet test set
 # RoBERTa-base (zero-shot baselines + fine-tuned)
-uv run python src/roberta_eval.py --checkpoint roberta-base                              --pooling cls        --output-dir results/roberta-base-zeroshot-cls
-uv run python src/roberta_eval.py --checkpoint roberta-base                              --pooling mean       --output-dir results/roberta-base-zeroshot-mean
-uv run python src/roberta_eval.py --checkpoint roberta-base                              --pooling last_token --output-dir results/roberta-base-zeroshot-last_token
-uv run python src/roberta_eval.py --checkpoint results/roberta-base-cls/best_model        --pooling cls
-uv run python src/roberta_eval.py --checkpoint results/roberta-base-mean/best_model       --pooling mean
-uv run python src/roberta_eval.py --checkpoint results/roberta-base-last_token/best_model --pooling last_token
+uv run python src/transformer_eval.py --checkpoint roberta-base                              --pooling cls        --output-dir results/roberta-base-zeroshot-cls
+uv run python src/transformer_eval.py --checkpoint roberta-base                              --pooling mean       --output-dir results/roberta-base-zeroshot-mean
+uv run python src/transformer_eval.py --checkpoint roberta-base                              --pooling last_token --output-dir results/roberta-base-zeroshot-last_token
+uv run python src/transformer_eval.py --checkpoint results/roberta-base-cls/best_model        --pooling cls
+uv run python src/transformer_eval.py --checkpoint results/roberta-base-mean/best_model       --pooling mean
+uv run python src/transformer_eval.py --checkpoint results/roberta-base-last_token/best_model --pooling last_token
 
 # RoBERTa-large
-uv run python src/roberta_eval.py --checkpoint roberta-large                              --pooling cls        --output-dir results/roberta-large-zeroshot-cls
-uv run python src/roberta_eval.py --checkpoint roberta-large                              --pooling mean       --output-dir results/roberta-large-zeroshot-mean
-uv run python src/roberta_eval.py --checkpoint roberta-large                              --pooling last_token --output-dir results/roberta-large-zeroshot-last_token
-uv run python src/roberta_eval.py --checkpoint results/roberta-large-cls/best_model        --pooling cls
-uv run python src/roberta_eval.py --checkpoint results/roberta-large-mean/best_model       --pooling mean
-uv run python src/roberta_eval.py --checkpoint results/roberta-large-last_token/best_model --pooling last_token
+uv run python src/transformer_eval.py --checkpoint roberta-large                              --pooling cls        --output-dir results/roberta-large-zeroshot-cls
+uv run python src/transformer_eval.py --checkpoint roberta-large                              --pooling mean       --output-dir results/roberta-large-zeroshot-mean
+uv run python src/transformer_eval.py --checkpoint roberta-large                              --pooling last_token --output-dir results/roberta-large-zeroshot-last_token
+uv run python src/transformer_eval.py --checkpoint results/roberta-large-cls/best_model        --pooling cls
+uv run python src/transformer_eval.py --checkpoint results/roberta-large-mean/best_model       --pooling mean
+uv run python src/transformer_eval.py --checkpoint results/roberta-large-last_token/best_model --pooling last_token
 
 # DeBERTa-v3-large
-uv run python src/deberta_eval.py --checkpoint microsoft/deberta-v3-large                   --pooling cls        --output-dir results/deberta-v3-large-zeroshot-cls
-uv run python src/deberta_eval.py --checkpoint microsoft/deberta-v3-large                   --pooling mean       --output-dir results/deberta-v3-large-zeroshot-mean
-uv run python src/deberta_eval.py --checkpoint microsoft/deberta-v3-large                   --pooling last_token --output-dir results/deberta-v3-large-zeroshot-last_token
-uv run python src/deberta_eval.py --checkpoint results/deberta-v3-large-cls/best_model        --pooling cls
-uv run python src/deberta_eval.py --checkpoint results/deberta-v3-large-mean/best_model       --pooling mean
-uv run python src/deberta_eval.py --checkpoint results/deberta-v3-large-last_token/best_model --pooling last_token
+uv run python src/transformer_eval.py --checkpoint microsoft/deberta-v3-large                   --pooling cls        --output-dir results/deberta-v3-large-zeroshot-cls
+uv run python src/transformer_eval.py --checkpoint microsoft/deberta-v3-large                   --pooling mean       --output-dir results/deberta-v3-large-zeroshot-mean
+uv run python src/transformer_eval.py --checkpoint microsoft/deberta-v3-large                   --pooling last_token --output-dir results/deberta-v3-large-zeroshot-last_token
+uv run python src/transformer_eval.py --checkpoint results/deberta-v3-large-cls/best_model        --pooling cls
+uv run python src/transformer_eval.py --checkpoint results/deberta-v3-large-mean/best_model       --pooling mean
+uv run python src/transformer_eval.py --checkpoint results/deberta-v3-large-last_token/best_model --pooling last_token
 
 # DeBERTa-v2-xxlarge
-uv run python src/deberta_eval.py --checkpoint results/deberta-v2-xxlarge-cls/best_model --pooling cls
+uv run python src/transformer_eval.py --checkpoint results/deberta-v2-xxlarge-cls/best_model --pooling cls
 
 # Mamba-2
-uv run python src/mamba_eval.py --checkpoint results/mamba2-130m-mean/best_model        --pooling mean
-uv run python src/mamba_eval.py --checkpoint results/mamba2-130m-last_token/best_model  --pooling last_token
-uv run python src/mamba_eval.py --checkpoint results/mamba2-370m-mean/best_model        --pooling mean
-uv run python src/mamba_eval.py --checkpoint results/mamba2-370m-last_token/best_model  --pooling last_token
-uv run python src/mamba_eval.py --checkpoint results/mamba2-1.3b-mean/best_model        --pooling mean
-uv run python src/mamba_eval.py --checkpoint results/mamba2-1.3b-last_token/best_model  --pooling last_token
+uv run python src/ssm_eval.py --checkpoint results/mamba2-130m-mean/best_model        --pooling mean
+uv run python src/ssm_eval.py --checkpoint results/mamba2-130m-last_token/best_model  --pooling last_token
+uv run python src/ssm_eval.py --checkpoint results/mamba2-370m-mean/best_model        --pooling mean
+uv run python src/ssm_eval.py --checkpoint results/mamba2-370m-last_token/best_model  --pooling last_token
+uv run python src/ssm_eval.py --checkpoint results/mamba2-1.3b-mean/best_model        --pooling mean
+uv run python src/ssm_eval.py --checkpoint results/mamba2-1.3b-last_token/best_model  --pooling last_token
 
 # 4. Phase 2 — clustering eval across all saved checkpoints
 uv run python src/phase2_eval.py

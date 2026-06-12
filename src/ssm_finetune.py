@@ -1,17 +1,17 @@
 """
-Fine-tuning script for DeBERTa dense retriever on math triplets.
+Fine-tuning script for Mamba-2 dense retriever on math triplets.
 
 Uses InfoNCE contrastive loss with in-batch negatives + explicit hard negatives.
-Each pooling strategy (cls, mean, last_token) is a separate training run so that
+Each pooling strategy (mean, last_token) is a separate training run so that
 training and evaluation use the same pooling — enabling clean ablation reporting.
 
 Usage:
-    python src/deberta_finetune.py \\
-        --model microsoft/deberta-v3-base \\
+    python src/ssm_finetune.py \\
+        --model state-spaces/mamba2-130m \\
         --pooling mean \\
         --train-file data/processed/triplets_train.jsonl \\
         --val-file   data/processed/triplets_val.jsonl \\
-        --output-dir results/deberta-v3-base-cls
+        --output-dir results/mamba2-130m-mean
 """
 
 import argparse
@@ -24,14 +24,12 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
+from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from tqdm import tqdm
-from transformers import (
-    AutoModel,
-    DebertaV2Tokenizer,
-    get_cosine_schedule_with_warmup,
-)
+from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from constants import PROJECT_ROOT
+from mamba_io import save_mamba, load_mamba
 from train_utils import pool, infonce_loss, StepLogger, optimizer_step
 from triplet_dataset import TripletDataset, collate_fn
 
@@ -41,16 +39,17 @@ from triplet_dataset import TripletDataset, collate_fn
 # ---------------------------------------------------------------------------
 
 def embed(
-    model: AutoModel,
+    model: MambaLMHeadModel,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     pooling: str,
 ) -> torch.Tensor:
     """Forward pass → pooled, L2-normalised embedding. Returns [B, D]."""
-    out = model(input_ids=input_ids, attention_mask=attention_mask)
-    hidden = out.last_hidden_state                          # [B, T, D]
+    # backbone returns the final hidden states tensor [B, T, D] directly
+    # (skipping the LM head we don't need for retrieval).
+    hidden = model.backbone(input_ids)
     emb = pool(hidden, attention_mask, pooling)
-    return F.normalize(emb, p=2, dim=-1)                   # [B, D]
+    return F.normalize(emb, p=2, dim=-1)   # [B, D]
 
 
 # ---------------------------------------------------------------------------
@@ -78,7 +77,7 @@ def _load_best_val_loss(log_path: Path) -> float:
 # ---------------------------------------------------------------------------
 
 def run_val(
-    model: AutoModel,
+    model: MambaLMHeadModel,
     val_loader: DataLoader,
     device: torch.device,
     pooling: str,
@@ -129,7 +128,6 @@ def train(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Tokenizer & model
     # ------------------------------------------------------------------
-    # Determine start epoch and model source
     start_epoch = 1
     if args.resume_from:
         resume_path = Path(args.resume_from)
@@ -145,17 +143,17 @@ def train(args: argparse.Namespace) -> None:
                     "Pass --start-epoch explicitly."
                 )
         print(f"Resuming from {resume_path} → starting at epoch {start_epoch}")
-        model = AutoModel.from_pretrained(str(resume_path), dtype=dtype)
+        model = load_mamba(resume_path, device=device, dtype=dtype)
     else:
-        model = AutoModel.from_pretrained(args.model, dtype=dtype)
+        # state-spaces/mamba2-* HF repos ship no tokenizer files. Canonical tokenizer
+        # for all Mamba-2 checkpoints is EleutherAI/gpt-neox-20b (matches the Mamba paper's
+        # Pile training setup and the team's tokenization_check.py).
+        model = MambaLMHeadModel.from_pretrained(args.model, device=device, dtype=dtype)
 
-    tokenizer_source = str(resume_path) if args.resume_from else args.model
-    tokenizer = DebertaV2Tokenizer.from_pretrained(tokenizer_source)
+    tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
+    tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-    model = model.to(device)
     model.train()
 
     # ------------------------------------------------------------------
@@ -297,13 +295,11 @@ def train(args: argparse.Namespace) -> None:
                         best_epoch = epoch
                         best_step = global_step
                         best_dir = output_dir / "best_model"
-                        model.save_pretrained(best_dir)
-                        tokenizer.save_pretrained(best_dir)
+                        save_mamba(model, best_dir)
                         print(f"  >> New best ({val_loss:.4f}) — saved to {best_dir}")
 
         # Flush any remaining accumulated gradients at end of epoch
         if step % args.grad_accum != 0:
-            elapsed = time.time() - accum_t0
             optimizer_step(model, optimizer, scheduler)
             global_step += 1
 
@@ -321,10 +317,9 @@ def train(args: argparse.Namespace) -> None:
             val_loss_epoch=round(val_loss, 6),
         )
 
-        # ------ Save epoch checkpoint ------
+        # ------ Save epoch checkpoint (enables --resume-from) ------
         epoch_dir = output_dir / f"checkpoint_epoch_{epoch:02d}"
-        model.save_pretrained(epoch_dir)
-        tokenizer.save_pretrained(epoch_dir)
+        save_mamba(model, epoch_dir)
         print(f"  >> Epoch checkpoint saved to {epoch_dir}")
 
         # ------ Best model + early stopping ------
@@ -334,8 +329,7 @@ def train(args: argparse.Namespace) -> None:
             best_step = global_step
             no_improve_epochs = 0
             best_dir = output_dir / "best_model"
-            model.save_pretrained(best_dir)
-            tokenizer.save_pretrained(best_dir)
+            save_mamba(model, best_dir)
             print(f"  >> New best ({val_loss:.4f}) — saved to {best_dir}")
         else:
             no_improve_epochs += 1
@@ -349,8 +343,7 @@ def train(args: argparse.Namespace) -> None:
     # Save final checkpoint
     # ------------------------------------------------------------------
     final_dir = output_dir / "final_model"
-    model.save_pretrained(final_dir)
-    tokenizer.save_pretrained(final_dir)
+    save_mamba(model, final_dir)
     print(f"Final model saved to {final_dir}")
 
     # Save run config alongside checkpoints
@@ -372,11 +365,11 @@ def train(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Fine-tune DeBERTa with InfoNCE contrastive loss")
+    p = argparse.ArgumentParser(description="Fine-tune Mamba-2 with InfoNCE contrastive loss")
 
-    p.add_argument("--model",       default="microsoft/deberta-v3-base",
+    p.add_argument("--model",       default="state-spaces/mamba2-130m",
                    help="HuggingFace model ID or local path")
-    p.add_argument("--pooling",     choices=["cls", "mean", "last_token"], required=True,
+    p.add_argument("--pooling",     choices=["mean", "last_token"], required=True,
                    help="Pooling strategy — determines the model variant being trained")
     p.add_argument("--train-file",  default="data/processed/triplets_train.jsonl")
     p.add_argument("--val-file",    default="data/processed/triplets_val.jsonl")
@@ -386,7 +379,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--grad-accum",  type=int, default=4,
                    help="Gradient accumulation steps. Effective batch = batch_size * grad_accum")
     p.add_argument("--lr",          type=float, default=2e-5)
-    p.add_argument("--epochs",      type=int, default=15)
+    p.add_argument("--epochs",      type=int, default=3)
     p.add_argument("--patience",    type=int, default=3,
                    help="Early stopping patience in epochs. Training stops if val loss does not improve for this many consecutive epochs.")
     p.add_argument("--max-len",     type=int, default=512)
@@ -395,10 +388,8 @@ def parse_args() -> argparse.Namespace:
                    help="Fraction of total steps used for linear warmup")
     p.add_argument("--val-every",   type=int, default=500,
                    help="Validate every N optimizer steps")
-    p.add_argument("--gradient-checkpointing", action="store_true", default=False,
-                   help="Enable gradient checkpointing to reduce GPU memory at the cost of speed")
     p.add_argument("--resume-from", default=None,
-                   help="Checkpoint directory to resume from (e.g. results/deberta-v3-large-cls/checkpoint_epoch_04). "
+                   help="Checkpoint directory to resume from (e.g. results/mamba2-130m-mean/checkpoint_epoch_02). "
                         "start-epoch is inferred from the directory name unless --start-epoch is also passed.")
     p.add_argument("--start-epoch", type=int, default=None,
                    help="Epoch to resume from (1-indexed). Only needed with --resume-from if the "
