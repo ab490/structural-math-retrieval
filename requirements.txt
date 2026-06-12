@@ -1,0 +1,8 @@
+bs4==0.0.2
+tqdm==4.67.3
+pandas==3.0.1
+pyarrow==23.0.1
+scikit-learn==1.8.0
+transformers==5.4.0
+numpy
+torch
