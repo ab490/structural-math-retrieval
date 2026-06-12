@@ -37,26 +37,8 @@ from transformers import AutoTokenizer
 
 from constants import PROJECT_ROOT
 from mamba_io import load_mamba
+from train_utils import pool
 from triplet_dataset import TripletDataset, collate_fn
-
-
-# ---------------------------------------------------------------------------
-# Pooling (same implementation as mamba_finetune.py)
-# ---------------------------------------------------------------------------
-
-def pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor, strategy: str) -> torch.Tensor:
-    if strategy == "mean":
-        mask = attention_mask.unsqueeze(-1).float()
-        summed = (hidden_states * mask).sum(dim=1)
-        counts = mask.sum(dim=1).clamp(min=1e-9)
-        return summed / counts
-    elif strategy == "last_token":
-        lengths = attention_mask.sum(dim=1) - 1          # [B]
-        B, _, D = hidden_states.shape
-        idx = lengths.view(B, 1, 1).expand(B, 1, D)
-        return hidden_states.gather(dim=1, index=idx).squeeze(1)
-    else:
-        raise ValueError(f"Unknown pooling strategy: {strategy!r}")
 
 
 def embed_batch(

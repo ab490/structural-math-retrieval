@@ -1,21 +1,19 @@
 #!/bin/bash
-# One-time setup: creates the 'aml-math' conda environment.
-# Run from the login node before submitting any jobs:
+# One-time setup: creates the project virtual environment with uv.
+# Run from the repo root:
 #   bash setup_env.sh
 
 set -e
 
-module load conda/25.3.0
+# Install uv if not already present
+if ! command -v uv &>/dev/null; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    # shellcheck disable=SC1091
+    source "$HOME/.local/bin/env"
+fi
 
-conda create -n aml-math python=3.11 -y
+# Create .venv and install all dependencies (reads pyproject.toml)
+uv sync
 
-source activate aml-math
-
-# PyTorch — let conda pick the right version and CUDA build for this system
-conda install pytorch -c pytorch -c nvidia -y
-
-# Remaining project dependencies
-pip install -r requirements.txt
-
-echo "Done. Activate with:"
-echo "  module load conda/25.3.0 && source activate aml-math"
+echo "Done. Activate the environment with:"
+echo "  source .venv/bin/activate"

@@ -17,7 +17,7 @@ Usage:
 import argparse
 import json
 import math
-import os
+import re
 import time
 from pathlib import Path
 
@@ -32,66 +32,8 @@ from transformers import (
 )
 
 from constants import PROJECT_ROOT
+from train_utils import pool, infonce_loss, StepLogger, optimizer_step
 from triplet_dataset import TripletDataset, collate_fn
-
-
-# ---------------------------------------------------------------------------
-# Pooling
-# ---------------------------------------------------------------------------
-
-def pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor, strategy: str) -> torch.Tensor:
-    """
-    Reduce sequence of hidden states to a single embedding vector.
-
-    hidden_states : [B, T, D]
-    attention_mask: [B, T]  (1=real token, 0=padding)
-    returns       : [B, D]
-    """
-    if strategy == "cls":
-        # [CLS] token is always at position 0 for DeBERTa.
-        return hidden_states[:, 0, :]                        # [B, D]
-
-    elif strategy == "mean":
-        mask = attention_mask.unsqueeze(-1).float()          # [B, T, 1]
-        summed = (hidden_states * mask).sum(dim=1)           # [B, D]
-        counts = mask.sum(dim=1).clamp(min=1e-9)             # [B, 1]
-        return summed / counts
-
-    elif strategy == "last_token":
-        # Index of the last real (non-padding) token per sequence.
-        # Right-padding is assumed (tokenizer.padding_side = "right").
-        lengths = attention_mask.sum(dim=1) - 1              # [B]
-        B, T, D = hidden_states.shape
-        idx = lengths.view(B, 1, 1).expand(B, 1, D)
-        return hidden_states.gather(dim=1, index=idx).squeeze(1)   # [B, D]
-
-    else:
-        raise ValueError(f"Unknown pooling strategy: {strategy!r}. Choose 'cls', 'mean', or 'last_token'.")
-
-
-# ---------------------------------------------------------------------------
-# Loss
-# ---------------------------------------------------------------------------
-
-def infonce_loss(
-    anchors: torch.Tensor,
-    positives: torch.Tensor,
-    negatives: torch.Tensor,
-    temperature: float,
-) -> torch.Tensor:
-    """
-    InfoNCE loss with in-batch negatives + explicit hard negative.
-
-    All inputs are L2-normalised [B, D] embeddings.
-
-    Candidates = [positives; negatives] → [2B, D].
-    For anchor i: positive is candidate i (diagonal in the [B, 2B] sim matrix).
-    Off-diagonal positives + all negatives serve as soft/hard negatives.
-    """
-    candidates = torch.cat([positives, negatives], dim=0)   # [2B, D]
-    logits = torch.matmul(anchors, candidates.T) / temperature  # [B, 2B]
-    labels = torch.arange(anchors.size(0), device=anchors.device)
-    return F.cross_entropy(logits, labels)
 
 
 # ---------------------------------------------------------------------------
@@ -131,21 +73,6 @@ def _load_best_val_loss(log_path: Path) -> float:
     return best
 
 
-class StepLogger:
-    """Appends one JSON line per step to a JSONL file."""
-
-    def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.f = open(path, "a")
-
-    def log(self, **kwargs) -> None:
-        self.f.write(json.dumps(kwargs) + "\n")
-        self.f.flush()
-
-    def close(self) -> None:
-        self.f.close()
-
-
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
@@ -181,14 +108,6 @@ def run_val(
     return total_loss / max(n_batches, 1)
 
 
-def _optimizer_step(model, optimizer, scheduler):
-    """Clip gradients, step optimizer and scheduler, then zero gradients."""
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-    optimizer.step()
-    scheduler.step()
-    optimizer.zero_grad()
-
-
 def train(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Setup
@@ -213,7 +132,6 @@ def train(args: argparse.Namespace) -> None:
     # Determine start epoch and model source
     start_epoch = 1
     if args.resume_from:
-        import re
         resume_path = Path(args.resume_from)
         if args.start_epoch is not None:
             start_epoch = args.start_epoch
@@ -231,7 +149,8 @@ def train(args: argparse.Namespace) -> None:
     else:
         model = AutoModel.from_pretrained(args.model, dtype=dtype)
 
-    tokenizer = DebertaV2Tokenizer.from_pretrained(args.model)
+    tokenizer_source = str(resume_path) if args.resume_from else args.model
+    tokenizer = DebertaV2Tokenizer.from_pretrained(tokenizer_source)
     tokenizer.padding_side = "right"
 
     if args.gradient_checkpointing:
@@ -342,7 +261,7 @@ def train(args: argparse.Namespace) -> None:
 
             if step % args.grad_accum == 0:
                 elapsed = time.time() - accum_t0
-                _optimizer_step(model, optimizer, scheduler)
+                optimizer_step(model, optimizer, scheduler)
                 global_step += 1
 
                 avg_loss = accum_loss / args.grad_accum
@@ -385,7 +304,7 @@ def train(args: argparse.Namespace) -> None:
         # Flush any remaining accumulated gradients at end of epoch
         if step % args.grad_accum != 0:
             elapsed = time.time() - accum_t0
-            _optimizer_step(model, optimizer, scheduler)
+            optimizer_step(model, optimizer, scheduler)
             global_step += 1
 
         # ------ End-of-epoch validation ------

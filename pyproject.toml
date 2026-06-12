@@ -1,0 +1,27 @@
+[project]
+name = "structural-math-retrieval"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "mamba-ssm>=2.0; sys_platform == 'linux'",
+    "numpy>=1.26",
+    "pandas>=3.0.1",
+    "pyarrow>=23.0.1",
+    "scikit-learn>=1.8.0",
+    "torch>=2.3",
+    "tqdm>=4.67.3",
+    "transformers>=5.4.0",
+]
+
+# On Linux pull PyTorch from the CUDA 12.6 wheel index.
+# On macOS the default PyPI torch (CPU/MPS) is used.
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu126", marker = "sys_platform == 'linux'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true

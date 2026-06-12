@@ -42,6 +42,7 @@ from sklearn.preprocessing import LabelEncoder
 from transformers import AutoModel, AutoTokenizer
 
 from constants import PROJECT_ROOT
+from train_utils import pool
 
 BATCH_SIZE = 32
 MAX_LEN    = 512
@@ -101,25 +102,6 @@ MODELS = [
     {"name": "Mamba-2 1.3B (mean)",                     "slug": "mamba2-1.3b-mean",                        "pooling": "mean",       "type": "mamba"},
     {"name": "Mamba-2 1.3B (last_token)",               "slug": "mamba2-1.3b-last_token",                  "pooling": "last_token", "type": "mamba"},
 ]
-
-
-# ---------------------------------------------------------------------------
-# Pooling
-# ---------------------------------------------------------------------------
-
-def pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor, strategy: str) -> torch.Tensor:
-    if strategy == "cls":
-        return hidden_states[:, 0, :]
-    elif strategy == "mean":
-        mask = attention_mask.unsqueeze(-1).float()
-        return (hidden_states * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1e-9)
-    elif strategy == "last_token":
-        lengths = attention_mask.sum(dim=1) - 1
-        B, _, D = hidden_states.shape
-        idx = lengths.view(B, 1, 1).expand(B, 1, D)
-        return hidden_states.gather(dim=1, index=idx).squeeze(1)
-    else:
-        raise ValueError(f"Unknown pooling: {strategy!r}")
 
 
 # ---------------------------------------------------------------------------

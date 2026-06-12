@@ -17,7 +17,7 @@ Usage:
 import argparse
 import json
 import math
-import os
+import re
 import time
 from pathlib import Path
 
@@ -25,69 +25,13 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
+from tqdm import tqdm
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from constants import PROJECT_ROOT
-from mamba_io import save_mamba
+from mamba_io import save_mamba, load_mamba
+from train_utils import pool, infonce_loss, StepLogger, optimizer_step
 from triplet_dataset import TripletDataset, collate_fn
-
-
-# ---------------------------------------------------------------------------
-# Pooling
-# ---------------------------------------------------------------------------
-
-def pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor, strategy: str) -> torch.Tensor:
-    """
-    Reduce sequence of hidden states to a single embedding vector.
-
-    hidden_states : [B, T, D]
-    attention_mask: [B, T]  (1=real token, 0=padding)
-    returns       : [B, D]
-    """
-    if strategy == "mean":
-        mask = attention_mask.unsqueeze(-1).float()          # [B, T, 1]
-        summed = (hidden_states * mask).sum(dim=1)           # [B, D]
-        counts = mask.sum(dim=1).clamp(min=1e-9)             # [B, 1]
-        return summed / counts
-
-    elif strategy == "last_token":
-        # Index of the last real (non-padding) token per sequence.
-        # Right-padding is assumed (tokenizer.padding_side = "right").
-        lengths = attention_mask.sum(dim=1) - 1              # [B]
-        B, T, D = hidden_states.shape
-        idx = lengths.view(B, 1, 1).expand(B, 1, D)
-        return hidden_states.gather(dim=1, index=idx).squeeze(1)   # [B, D]
-
-    else:
-        raise ValueError(f"Unknown pooling strategy: {strategy!r}. Choose 'mean' or 'last_token'.")
-
-
-# ---------------------------------------------------------------------------
-# Loss
-# ---------------------------------------------------------------------------
-
-def infonce_loss(
-    anchors: torch.Tensor,
-    positives: torch.Tensor,
-    negatives: torch.Tensor,
-    temperature: float,
-) -> torch.Tensor:
-    """
-    InfoNCE loss with in-batch negatives + explicit hard negative.
-
-    All inputs are L2-normalised [B, D] embeddings.
-
-    Candidates = [positives; negatives] → [2B, D].
-    For anchor i: positive is candidate i (diagonal in the [B, 2B] sim matrix).
-    Off-diagonal positives + all negatives serve as soft/hard negatives.
-    """
-    # [2B, D]
-    candidates = torch.cat([positives, negatives], dim=0)
-    # [B, 2B]
-    logits = torch.matmul(anchors, candidates.T) / temperature
-    # Labels: i-th anchor matches i-th positive (first B candidates)
-    labels = torch.arange(anchors.size(0), device=anchors.device)
-    return F.cross_entropy(logits, labels)
 
 
 # ---------------------------------------------------------------------------
@@ -112,19 +56,20 @@ def embed(
 # Logging
 # ---------------------------------------------------------------------------
 
-class StepLogger:
-    """Appends one JSON line per step to a JSONL file."""
-
-    def __init__(self, path: Path) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.f = open(path, "a")
-
-    def log(self, **kwargs) -> None:
-        self.f.write(json.dumps(kwargs) + "\n")
-        self.f.flush()
-
-    def close(self) -> None:
-        self.f.close()
+def _load_best_val_loss(log_path: Path) -> float:
+    """Scan an existing train_log.jsonl and return the lowest val_loss_epoch seen."""
+    best = float("inf")
+    if not log_path.exists():
+        return best
+    with open(log_path) as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+                if "val_loss_epoch" in entry:
+                    best = min(best, entry["val_loss_epoch"])
+            except json.JSONDecodeError:
+                pass
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -169,8 +114,7 @@ def train(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    run_name = output_dir.name
-    log_path = PROJECT_ROOT / "logs" / f"{run_name}_train.jsonl"
+    log_path = output_dir / "train_log.jsonl"
     logger = StepLogger(log_path)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -184,17 +128,32 @@ def train(args: argparse.Namespace) -> None:
     # ------------------------------------------------------------------
     # Tokenizer & model
     # ------------------------------------------------------------------
-    # state-spaces/mamba2-* HF repos ship no tokenizer files. Canonical tokenizer
-    # for all Mamba-2 checkpoints is EleutherAI/gpt-neox-20b (matches the Mamba paper's
-    # Pile training setup and the team's tokenization_check.py).
+    start_epoch = 1
+    if args.resume_from:
+        resume_path = Path(args.resume_from)
+        if args.start_epoch is not None:
+            start_epoch = args.start_epoch
+        else:
+            m = re.search(r"checkpoint_epoch_(\d+)", resume_path.name)
+            if m:
+                start_epoch = int(m.group(1)) + 1
+            else:
+                raise ValueError(
+                    f"Cannot infer start_epoch from '{resume_path.name}'. "
+                    "Pass --start-epoch explicitly."
+                )
+        print(f"Resuming from {resume_path} → starting at epoch {start_epoch}")
+        model = load_mamba(resume_path, device=device, dtype=dtype)
+    else:
+        # state-spaces/mamba2-* HF repos ship no tokenizer files. Canonical tokenizer
+        # for all Mamba-2 checkpoints is EleutherAI/gpt-neox-20b (matches the Mamba paper's
+        # Pile training setup and the team's tokenization_check.py).
+        model = MambaLMHeadModel.from_pretrained(args.model, device=device, dtype=dtype)
+
     tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
 
-    # mamba-ssm's MambaLMHeadModel reads state-spaces' native config schema
-    # (d_model, n_layer, ssm_cfg, ...) — unlike transformers.Mamba2Model which
-    # expects HF schema and silently fell back to mamba2-2.8b defaults.
-    model = MambaLMHeadModel.from_pretrained(args.model, device=device, dtype=dtype)
     model.train()
 
     # ------------------------------------------------------------------
@@ -243,18 +202,44 @@ def train(args: argparse.Namespace) -> None:
     print(f"Total opt steps: {total_steps} | Warmup steps: {warmup_steps}")
 
     # ------------------------------------------------------------------
+    # Resume: fast-forward scheduler to the correct step position
+    # ------------------------------------------------------------------
+    global_step = 0
+    best_val_loss = float("inf")
+
+    if args.resume_from and start_epoch > 1:
+        completed_opt_steps = steps_per_epoch * (start_epoch - 1) // args.grad_accum
+        for _ in range(completed_opt_steps):
+            scheduler.step()
+        global_step = completed_opt_steps
+        best_val_loss = _load_best_val_loss(log_path)
+        current_lr = scheduler.get_last_lr()[0]
+        print(
+            f"Resumed: fast-forwarded scheduler to step {global_step}/{total_steps} "
+            f"(lr={current_lr:.3e}) | best_val_loss so far: {best_val_loss:.4f}"
+        )
+
+    # ------------------------------------------------------------------
     # Training loop
     # ------------------------------------------------------------------
-    best_val_loss = float("inf")
-    global_step = 0
+    best_epoch = 0
+    best_step = 0
     accum_loss = 0.0
+    no_improve_epochs = 0
+    stopped_epoch = args.epochs
 
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         optimizer.zero_grad()
 
-        for step, batch in enumerate(train_loader, start=1):
-            t0 = time.time()
+        epoch_train_loss = 0.0
+        epoch_opt_steps = 0
+        accum_t0 = time.time()
+
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}", unit="batch", dynamic_ncols=True)
+        for step, batch in enumerate(pbar, start=1):
+            if (step - 1) % args.grad_accum == 0:
+                accum_t0 = time.time()
 
             a_ids  = batch["anchor_input_ids"].to(device)
             a_mask = batch["anchor_attention_mask"].to(device)
@@ -273,15 +258,14 @@ def train(args: argparse.Namespace) -> None:
             accum_loss += loss.item()
 
             if step % args.grad_accum == 0:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad()
+                elapsed = time.time() - accum_t0
+                optimizer_step(model, optimizer, scheduler)
                 global_step += 1
 
                 avg_loss = accum_loss / args.grad_accum
                 accum_loss = 0.0
-                elapsed = time.time() - t0
+                epoch_train_loss += avg_loss
+                epoch_opt_steps += 1
 
                 logger.log(
                     epoch=epoch,
@@ -291,13 +275,13 @@ def train(args: argparse.Namespace) -> None:
                     elapsed_s=round(elapsed, 3),
                 )
 
-                if global_step % 100 == 0:
-                    print(
-                        f"Epoch {epoch} | Step {global_step} | "
-                        f"loss={avg_loss:.4f} | lr={scheduler.get_last_lr()[0]:.2e}"
-                    )
+                pbar.set_postfix(
+                    loss=f"{avg_loss:.4f}",
+                    lr=f"{scheduler.get_last_lr()[0]:.2e}",
+                    step=global_step,
+                )
 
-                # ------ Validation ------
+                # ------ Mid-epoch validation ------
                 if global_step % args.val_every == 0:
                     val_loss = run_val(model, val_loader, device, args.pooling, args.temperature)
                     print(f"  >> Val loss: {val_loss:.4f}")
@@ -308,20 +292,52 @@ def train(args: argparse.Namespace) -> None:
                     )
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
+                        best_epoch = epoch
+                        best_step = global_step
                         best_dir = output_dir / "best_model"
                         save_mamba(model, best_dir)
                         print(f"  >> New best ({val_loss:.4f}) — saved to {best_dir}")
 
-        # End-of-epoch validation
-        val_loss = run_val(model, val_loader, device, args.pooling, args.temperature)
-        print(f"Epoch {epoch} done | Val loss: {val_loss:.4f}")
-        logger.log(epoch=epoch, global_step=global_step, val_loss_epoch=round(val_loss, 6))
+        # Flush any remaining accumulated gradients at end of epoch
+        if step % args.grad_accum != 0:
+            optimizer_step(model, optimizer, scheduler)
+            global_step += 1
 
+        # ------ End-of-epoch validation ------
+        val_loss = run_val(model, val_loader, device, args.pooling, args.temperature)
+        avg_epoch_train_loss = epoch_train_loss / max(epoch_opt_steps, 1)
+        print(
+            f"Epoch {epoch} done | "
+            f"Train loss: {avg_epoch_train_loss:.4f} | Val loss: {val_loss:.4f}"
+        )
+        logger.log(
+            epoch=epoch,
+            global_step=global_step,
+            epoch_train_loss=round(avg_epoch_train_loss, 6),
+            val_loss_epoch=round(val_loss, 6),
+        )
+
+        # ------ Save epoch checkpoint (enables --resume-from) ------
+        epoch_dir = output_dir / f"checkpoint_epoch_{epoch:02d}"
+        save_mamba(model, epoch_dir)
+        print(f"  >> Epoch checkpoint saved to {epoch_dir}")
+
+        # ------ Best model + early stopping ------
         if val_loss < best_val_loss:
             best_val_loss = val_loss
+            best_epoch = epoch
+            best_step = global_step
+            no_improve_epochs = 0
             best_dir = output_dir / "best_model"
             save_mamba(model, best_dir)
             print(f"  >> New best ({val_loss:.4f}) — saved to {best_dir}")
+        else:
+            no_improve_epochs += 1
+            print(f"  >> No improvement for {no_improve_epochs}/{args.patience} epochs")
+            if no_improve_epochs >= args.patience:
+                stopped_epoch = epoch
+                print(f"Early stopping triggered after epoch {epoch} (patience={args.patience})")
+                break
 
     # ------------------------------------------------------------------
     # Save final checkpoint
@@ -333,7 +349,10 @@ def train(args: argparse.Namespace) -> None:
     # Save run config alongside checkpoints
     config = vars(args)
     config["best_val_loss"] = best_val_loss
+    config["best_epoch"] = best_epoch
+    config["best_step"] = best_step
     config["total_steps"] = global_step
+    config["stopped_epoch"] = stopped_epoch
     with open(output_dir / "run_config.json", "w") as f:
         json.dump(config, f, indent=2)
 
@@ -361,12 +380,20 @@ def parse_args() -> argparse.Namespace:
                    help="Gradient accumulation steps. Effective batch = batch_size * grad_accum")
     p.add_argument("--lr",          type=float, default=2e-5)
     p.add_argument("--epochs",      type=int, default=3)
+    p.add_argument("--patience",    type=int, default=3,
+                   help="Early stopping patience in epochs. Training stops if val loss does not improve for this many consecutive epochs.")
     p.add_argument("--max-len",     type=int, default=512)
     p.add_argument("--temperature", type=float, default=0.07)
     p.add_argument("--warmup-ratio",type=float, default=0.1,
                    help="Fraction of total steps used for linear warmup")
     p.add_argument("--val-every",   type=int, default=500,
                    help="Validate every N optimizer steps")
+    p.add_argument("--resume-from", default=None,
+                   help="Checkpoint directory to resume from (e.g. results/mamba2-130m-mean/checkpoint_epoch_02). "
+                        "start-epoch is inferred from the directory name unless --start-epoch is also passed.")
+    p.add_argument("--start-epoch", type=int, default=None,
+                   help="Epoch to resume from (1-indexed). Only needed with --resume-from if the "
+                        "checkpoint name does not follow the checkpoint_epoch_NN convention.")
 
     args = p.parse_args()
 

@@ -35,31 +35,8 @@ from torch.utils.data import DataLoader
 from transformers import AutoModel, AutoTokenizer
 
 from constants import PROJECT_ROOT
+from train_utils import pool
 from triplet_dataset import TripletDataset, collate_fn
-
-
-# ---------------------------------------------------------------------------
-# Pooling (same implementation as roberta_finetune.py)
-# ---------------------------------------------------------------------------
-
-def pool(hidden_states: torch.Tensor, attention_mask: torch.Tensor, strategy: str) -> torch.Tensor:
-    if strategy == "cls":
-        return hidden_states[:, 0, :]
-
-    elif strategy == "mean":
-        mask = attention_mask.unsqueeze(-1).float()
-        summed = (hidden_states * mask).sum(dim=1)
-        counts = mask.sum(dim=1).clamp(min=1e-9)
-        return summed / counts
-
-    elif strategy == "last_token":
-        lengths = attention_mask.sum(dim=1) - 1          # [B]
-        B, _, D = hidden_states.shape
-        idx = lengths.view(B, 1, 1).expand(B, 1, D)
-        return hidden_states.gather(dim=1, index=idx).squeeze(1)
-
-    else:
-        raise ValueError(f"Unknown pooling strategy: {strategy!r}")
 
 
 def embed_batch(

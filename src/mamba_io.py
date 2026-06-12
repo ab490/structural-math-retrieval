@@ -28,6 +28,6 @@ def load_mamba(checkpoint_dir, device, dtype) -> MambaLMHeadModel:
     with open(checkpoint_dir / "config.json") as f:
         config = MambaConfig(**json.load(f))
     model = MambaLMHeadModel(config, device=device, dtype=dtype)
-    state = torch.load(checkpoint_dir / "pytorch_model.bin", map_location=device)
+    state = torch.load(checkpoint_dir / "pytorch_model.bin", map_location=device, weights_only=True)
     model.load_state_dict(state)
     return model

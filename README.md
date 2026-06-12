@@ -18,9 +18,10 @@ src/
   tokenization_check.py   # tokenizer comparison (results/tokenization_check.json)
   inspect_data.py         # tag frequency analysis
   triplet_dataset.py      # shared dataset class
+  train_utils.py          # shared pool, infonce_loss, StepLogger, optimizer_step
   constants.py            # paths
-  roberta_finetune.py     # RoBERTa/DeBERTa training (InfoNCE, all poolings)
-  roberta_eval.py         # Phase 1 eval for RoBERTa/DeBERTa
+  roberta_finetune.py     # RoBERTa training (InfoNCE, all poolings)
+  roberta_eval.py         # Phase 1 eval for RoBERTa
   deberta_finetune.py     # DeBERTa training
   deberta_eval.py         # Phase 1 eval for DeBERTa
   mamba_finetune.py       # Mamba-2 training
@@ -29,65 +30,98 @@ src/
   phase2_eval.py          # Phase 2 clustering (ARI, silhouette)
   compare_results.py      # cross-model comparison table
 
-bash_scripts/
-  data_processing.sh      # run parse + build_triplets
-  roberta_train.sh        # SLURM: train RoBERTa-base + RoBERTa-large
-  roberta_eval.sh         # SLURM: eval RoBERTa-base + RoBERTa-large
-  deberta_train.sh        # SLURM: train DeBERTa (supports --resume-from)
-  deberta_eval.sh         # SLURM: eval DeBERTa
-  mamba_train.sh          # SLURM: train Mamba-2
-  mamba_eval.sh           # SLURM: eval Mamba-2
-  phase2_eval.sh          # SLURM: Phase 2 clustering eval
-
 data/processed/           # triplets + diagnostic sets (gitignored, on OneDrive)
-results/                  # eval_results.json + phase2 JSON (gitignored, on OneDrive)
-logs/                     # SLURM .out/.err + training .jsonl logs (gitignored)
+results/                  # checkpoints + eval JSON (gitignored, on OneDrive)
+logs/                     # training .jsonl logs (gitignored)
 ```
 
 ---
 
 ## Setup
 
-**Cluster:** Big Red 200 (IU HPC) · Conda env: `aml-math`
-
-Before submitting any SLURM job, set your email and account in each script:
-```bash
-#SBATCH --mail-user=<your-email>
-#SBATCH -A <your-account>
-```
+Requires Python 3.11+ and [uv](https://docs.astral.sh/uv/getting-started/installation/).
 
 ```bash
-# activate environment
-conda activate aml-math
-
-# all scripts are run from bash_scripts/
-cd bash_scripts/
+bash setup_env.sh
 ```
 
-Data lives at `data/processed/` (download from OneDrive if not present). Model checkpoints land in `results/<model-slug>-<pooling>/best_model/`.
+This creates `.venv/` and installs all dependencies. CUDA wheels are pulled automatically on Linux. Data lives at `data/processed/` (download from OneDrive if not present). Checkpoints land in `results/<model-slug>-<pooling>/best_model/`.
 
 ---
 
 ## Reproducing
 
-Run in order from `bash_scripts/`:
+All commands run from the repo root via `uv run`. Training requires a CUDA GPU; 80 GB (A100-class) is needed for the 1.3B Mamba and DeBERTa-v2-xxlarge runs. Eval can run on CPU but is slow for large models.
+
+**Raw data:** Step 1 expects `data/raw/arqmath/Posts.V1.3.xml` from the ARQMath-3 dataset (Math Stack Exchange posts). If you downloaded the already-processed triplets from OneDrive, place them in `data/processed/` and skip Step 1.
 
 ```bash
-# 1. Data
-sbatch data_processing.sh          # parse ARQMath XML -> triplets
+# 1. Data — parse ARQMath XML and build contrastive triplets
+uv run python src/parse_arqmath.py
+uv run python src/build_triplets.py
+uv run python src/build_diagnostic_set.py
 
-# 2. Training
-sbatch roberta_train.sh             # RoBERTa-base + RoBERTa-large
-sbatch deberta_train.sh             # DeBERTa-v3-large 
-sbatch mamba_train.sh               # Mamba-2 130M / 370M / 1.3B
+# 2. Training — checkpoints saved to results/<model-slug>-<pooling>/
+# RoBERTa
+uv run python src/roberta_finetune.py --model roberta-base  --pooling cls
+uv run python src/roberta_finetune.py --model roberta-base  --pooling mean
+uv run python src/roberta_finetune.py --model roberta-base  --pooling last_token
+uv run python src/roberta_finetune.py --model roberta-large --pooling cls
+uv run python src/roberta_finetune.py --model roberta-large --pooling mean
+uv run python src/roberta_finetune.py --model roberta-large --pooling last_token
 
-# 3. Phase 1 eval
-sbatch roberta_eval.sh
-sbatch deberta_eval.sh
-sbatch mamba_eval.sh
+# DeBERTa (--gradient-checkpointing for xxlarge to fit in memory)
+uv run python src/deberta_finetune.py --model microsoft/deberta-v3-large   --pooling cls        --batch-size 8 --grad-accum 8
+uv run python src/deberta_finetune.py --model microsoft/deberta-v3-large   --pooling mean       --batch-size 8 --grad-accum 8
+uv run python src/deberta_finetune.py --model microsoft/deberta-v3-large   --pooling last_token --batch-size 8 --grad-accum 8
+uv run python src/deberta_finetune.py --model microsoft/deberta-v2-xxlarge --pooling cls        --batch-size 8 --grad-accum 8 --gradient-checkpointing
 
-# 4. Phase 2 clustering eval (all models at once)
-sbatch phase2_eval.sh
+# Mamba-2 (reduce --batch-size / increase --grad-accum for larger models)
+uv run python src/mamba_finetune.py --model state-spaces/mamba2-130m --pooling mean
+uv run python src/mamba_finetune.py --model state-spaces/mamba2-130m --pooling last_token
+uv run python src/mamba_finetune.py --model state-spaces/mamba2-370m --pooling mean
+uv run python src/mamba_finetune.py --model state-spaces/mamba2-370m --pooling last_token
+uv run python src/mamba_finetune.py --model state-spaces/mamba2-1.3b --pooling mean       --batch-size 8 --grad-accum 8
+uv run python src/mamba_finetune.py --model state-spaces/mamba2-1.3b --pooling last_token --batch-size 8 --grad-accum 8
+
+# 3. Phase 1 eval — retrieval metrics on the 31k-triplet test set
+# RoBERTa-base (zero-shot baselines + fine-tuned)
+uv run python src/roberta_eval.py --checkpoint roberta-base                              --pooling cls        --output-dir results/roberta-base-zeroshot-cls
+uv run python src/roberta_eval.py --checkpoint roberta-base                              --pooling mean       --output-dir results/roberta-base-zeroshot-mean
+uv run python src/roberta_eval.py --checkpoint roberta-base                              --pooling last_token --output-dir results/roberta-base-zeroshot-last_token
+uv run python src/roberta_eval.py --checkpoint results/roberta-base-cls/best_model        --pooling cls
+uv run python src/roberta_eval.py --checkpoint results/roberta-base-mean/best_model       --pooling mean
+uv run python src/roberta_eval.py --checkpoint results/roberta-base-last_token/best_model --pooling last_token
+
+# RoBERTa-large
+uv run python src/roberta_eval.py --checkpoint roberta-large                              --pooling cls        --output-dir results/roberta-large-zeroshot-cls
+uv run python src/roberta_eval.py --checkpoint roberta-large                              --pooling mean       --output-dir results/roberta-large-zeroshot-mean
+uv run python src/roberta_eval.py --checkpoint roberta-large                              --pooling last_token --output-dir results/roberta-large-zeroshot-last_token
+uv run python src/roberta_eval.py --checkpoint results/roberta-large-cls/best_model        --pooling cls
+uv run python src/roberta_eval.py --checkpoint results/roberta-large-mean/best_model       --pooling mean
+uv run python src/roberta_eval.py --checkpoint results/roberta-large-last_token/best_model --pooling last_token
+
+# DeBERTa-v3-large
+uv run python src/deberta_eval.py --checkpoint microsoft/deberta-v3-large                   --pooling cls        --output-dir results/deberta-v3-large-zeroshot-cls
+uv run python src/deberta_eval.py --checkpoint microsoft/deberta-v3-large                   --pooling mean       --output-dir results/deberta-v3-large-zeroshot-mean
+uv run python src/deberta_eval.py --checkpoint microsoft/deberta-v3-large                   --pooling last_token --output-dir results/deberta-v3-large-zeroshot-last_token
+uv run python src/deberta_eval.py --checkpoint results/deberta-v3-large-cls/best_model        --pooling cls
+uv run python src/deberta_eval.py --checkpoint results/deberta-v3-large-mean/best_model       --pooling mean
+uv run python src/deberta_eval.py --checkpoint results/deberta-v3-large-last_token/best_model --pooling last_token
+
+# DeBERTa-v2-xxlarge
+uv run python src/deberta_eval.py --checkpoint results/deberta-v2-xxlarge-cls/best_model --pooling cls
+
+# Mamba-2
+uv run python src/mamba_eval.py --checkpoint results/mamba2-130m-mean/best_model        --pooling mean
+uv run python src/mamba_eval.py --checkpoint results/mamba2-130m-last_token/best_model  --pooling last_token
+uv run python src/mamba_eval.py --checkpoint results/mamba2-370m-mean/best_model        --pooling mean
+uv run python src/mamba_eval.py --checkpoint results/mamba2-370m-last_token/best_model  --pooling last_token
+uv run python src/mamba_eval.py --checkpoint results/mamba2-1.3b-mean/best_model        --pooling mean
+uv run python src/mamba_eval.py --checkpoint results/mamba2-1.3b-last_token/best_model  --pooling last_token
+
+# 4. Phase 2 — clustering eval across all saved checkpoints
+uv run python src/phase2_eval.py
 ```
 
 ---
