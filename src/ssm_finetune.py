@@ -29,7 +29,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, get_cosine_schedule_with_warmup
 
 from constants import PROJECT_ROOT
-from mamba_io import save_mamba, load_mamba
+from ssm_io import save_mamba, load_mamba
 from train_utils import pool, infonce_loss, StepLogger, optimizer_step
 from triplet_dataset import TripletDataset, collate_fn
 

@@ -110,10 +110,10 @@ MODELS = [
 
 def load_model_and_tokenizer(checkpoint: str, model_type: str, dtype, device):
     if model_type == "mamba":
-        # Mamba checkpoints are saved by src/mamba_io.save_mamba (mamba-ssm format),
+        # Mamba checkpoints are saved by src/ssm_io.save_mamba (mamba-ssm format),
         # not transformers' Mamba2Model. Tokenizer is hardcoded to EleutherAI/gpt-neox-20b
         # (canonical for Mamba-2; state-spaces repos ship no tokenizer).
-        from mamba_io import load_mamba
+        from ssm_io import load_mamba
         model = load_mamba(checkpoint, device=device, dtype=dtype)
         tokenizer = AutoTokenizer.from_pretrained("EleutherAI/gpt-neox-20b")
         tokenizer.pad_token = tokenizer.eos_token

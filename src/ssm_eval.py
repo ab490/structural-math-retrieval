@@ -36,7 +36,7 @@ from mamba_ssm.models.mixer_seq_simple import MambaLMHeadModel
 from transformers import AutoTokenizer
 
 from constants import PROJECT_ROOT
-from mamba_io import load_mamba
+from ssm_io import load_mamba
 from train_utils import pool
 from triplet_dataset import TripletDataset, collate_fn
 
@@ -263,7 +263,7 @@ def evaluate(args: argparse.Namespace) -> None:
     tokenizer.padding_side = "right"
 
     # --checkpoint can be either:
-    #   (a) a local fine-tuned checkpoint dir (best_model/ or final_model/) — load via mamba_io
+    #   (a) a local fine-tuned checkpoint dir (best_model/ or final_model/) — load via ssm_io
     #   (b) an HF model id (e.g. state-spaces/mamba2-130m) for zero-shot baselines
     checkpoint_path = Path(args.checkpoint)
     if checkpoint_path.is_dir() and (checkpoint_path / "config.json").exists():

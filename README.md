@@ -24,7 +24,7 @@ src/
   transformer_eval.py      # Phase 1 eval for transformers
   ssm_finetune.py          # Mamba-2 (SSM) training
   ssm_eval.py              # Phase 1 eval for Mamba-2
-  mamba_io.py             # Mamba checkpoint loading
+  ssm_io.py               # SSM checkpoint save/load
   phase2_eval.py          # Phase 2 clustering (ARI, silhouette)
   compare_results.py      # cross-model comparison table
 
